@@ -321,47 +321,63 @@ def finalize(db):
     w = w.sort_values(["week_ending", "community_id"]).reset_index(drop=True)
     db["weekly"] = w
 
-    # 2) Change log, by submarket (so partial legacy coverage doesn't create noise)
-    w["_sub"] = w["community_id"].map(cmap["submarket"])
+    # 2) Change log - evaluated per community, against the weeks that actually
+    #    cover it: every Ryness PDF week for its market, plus any week it has a
+    #    legacy/manual row. Weeks can be imported in any order (older reports
+    #    backfill cleanly) and partial legacy coverage never creates false flags.
     pres = w[_present(w)]
-    events = []
-    for sub, gs in pres.groupby("_sub"):
-        weeks = sorted(gs["week_ending"].unique())
-        pdf_weeks = set(gs.loc[gs["source"] == SRC_PDF, "week_ending"])
-        seen: set = set()
-        prev_set: set = set()
-        prev_flags: dict = {}
-        for wk in weeks:
-            cur = gs[gs["week_ending"] == wk]
-            cur_set = set(cur["community_id"])
-            flags = dict(zip(cur["community_id"], cur["report_flag"].fillna("")))
-            if wk in pdf_weeks:
-                for cid in cur_set - prev_set:
-                    if cid not in seen:
-                        ev = "NEW" if seen else "ADDED"
-                        note = cur.loc[cur["community_id"] == cid, "ryness_notes"].fillna("").iloc[0]
-                        if str(note).strip().lower() == "new":
-                            ev = "NEW"
+    pdf_rows = w[w["source"] == SRC_PDF]
+    pdf_weeks_by_mkt = pdf_rows.groupby("market")["week_ending"].agg(lambda x: set(x)).to_dict()
+    other_cov = (w[w["source"].isin([SRC_LEGACY, SRC_MANUAL])]
+                 .groupby("community_id")["week_ending"].agg(lambda x: set(x)).to_dict())
+    present_wks = pres.groupby("community_id")["week_ending"].agg(lambda x: set(x)).to_dict()
+    flag_at = {(r.community_id, r.week_ending): (r.report_flag if isinstance(r.report_flag, str) else "")
+               for r in pdf_rows.itertuples()}
+    note_at = {(r.community_id, r.week_ending): (r.ryness_notes if isinstance(r.ryness_notes, str) else "")
+               for r in pdf_rows.itertuples()}
+    sub_of = cmap["submarket"].to_dict()
+    sub_first = (pres.assign(_sub=pres["community_id"].map(sub_of))
+                 .groupby("_sub")["week_ending"].min().to_dict())
+
+    events, coverage = [], {}
+    for cid in cmap.index:
+        mkt = cmap.at[cid, "market"]
+        pw = pdf_weeks_by_mkt.get(mkt, set())
+        cov = sorted(other_cov.get(cid, set()) | (set() if cid in manual_ids else pw))
+        coverage[cid] = cov
+        if cid in manual_ids:
+            continue
+        P = present_wks.get(cid, set())
+        seen, prev_p, prev_flag, last_p = False, False, "", None
+        for wk in cov:
+            p = wk in P
+            if wk in pw:
+                if p and not prev_p:
+                    if not seen:
+                        note = note_at.get((cid, wk), "")
+                        sf = sub_first.get(sub_of.get(cid))
+                        ev = "NEW" if (note.strip().lower() == "new" or (sf is not None and sf < wk)) else "ADDED"
                         detail = ("First appearance on the Ryness report" if ev == "NEW"
                                   else "First week tracked in this database")
-                        if str(note).strip():
+                        if note.strip():
                             detail += f" (Ryness note: {note})"
                         events.append((wk, cid, ev, detail))
                     else:
-                        events.append((wk, cid, "RETURNED", "Back on the report after being absent"))
-                for cid in prev_set - cur_set - manual_ids:
-                    lastp = max(x for x in weeks if x < wk and cid in set(gs.loc[gs["week_ending"] == x, "community_id"]))
+                        events.append((wk, cid, "RETURNED", "Back on the report after being absent"
+                                       + (f" (last reported {last_p:%m/%d/%y})" if last_p else "")))
+                elif prev_p and not p:
                     events.append((wk, cid, "DROPPED", "No longer on the Ryness report - likely sold out / "
-                                   f"temporarily sold out (last reported {lastp:%m/%d/%y})"))
-                for cid in cur_set & set(flags):
-                    f = flags[cid]
-                    if f and prev_flags.get(cid, "") != f:
-                        events.append((wk, cid, f"FLAG {f}",
-                                       "Ryness marks this community " +
-                                       ("Sold Out" if f == "S/O" else "Temporarily Sold Out")))
-            seen |= cur_set
-            prev_set, prev_flags = cur_set, flags
-    w.drop(columns="_sub", inplace=True)
+                                   f"temporarily sold out (last reported {last_p:%m/%d/%y})"))
+                f = flag_at.get((cid, wk), "")
+                if p and f and f != prev_flag:
+                    events.append((wk, cid, f"FLAG {f}", "Ryness marks this community " +
+                                   ("Sold Out" if f == "S/O" else "Temporarily Sold Out")))
+                if p:
+                    prev_flag = f
+            if p:
+                seen, last_p = True, wk
+            prev_p = p
+
     chg = pd.DataFrame(events, columns=["week_ending", "community_id", "event", "detail"])
     chg["market"] = chg["community_id"].map(cmap["market"])
     chg["submarket"] = chg["community_id"].map(cmap["submarket"])
@@ -387,36 +403,29 @@ def finalize(db):
                           ascending=[False, True, True, True, True]).drop(columns="_o")
     db["change_log"] = chg.reindex(columns=CHG_COLS).reset_index(drop=True)
 
-    # 3) Community status (relative to the latest week its submarket has data)
-    sub_last = {}
-    for sub, gs in pres.assign(_sub=pres["community_id"].map(cmap["submarket"])).groupby("_sub"):
-        sub_last[sub] = max(gs["week_ending"])
-    sub_weeks = {}
-    for sub, gs in pres.assign(_sub=pres["community_id"].map(cmap["submarket"])).groupby("_sub"):
-        sub_weeks[sub] = sorted(gs["week_ending"].unique())
-    last_present = pres.groupby("community_id")["week_ending"].max()
+    # 3) Community status, relative to the latest week that covers each community
     ev_at = {(r.community_id, r.week_ending): r.event for r in chg.itertuples()
              if r.event in ("NEW", "ADDED", "RETURNED", "DROPPED")}
-    latest_flag = (w[w["source"] == SRC_PDF].sort_values("week_ending")
-                   .groupby("community_id")["report_flag"].last())
+    latest_flag = (pdf_rows.sort_values("week_ending").groupby("community_id")["report_flag"].last())
+    first_present = pres.groupby("community_id")["week_ending"].min()
+    last_present = pres.groupby("community_id")["week_ending"].max()
 
     statuses, firsts, lasts, offs = [], [], [], []
     for r in comm.itertuples():
-        cid, sub = r.community_id, r.submarket
+        cid = r.community_id
         fp, lp = first_present.get(cid), last_present.get(cid)
-        L = sub_last.get(sub)
+        cov = coverage.get(cid, [])
+        L = cov[-1] if cov else None
         firsts.append(fp)
         lasts.append(lp)
         if cid in manual_ids:
             statuses.append("MANUAL (not on Ryness)")
             offs.append(None)
-            continue
-        if lp is None:
+        elif lp is None:
             statuses.append("SOLD OUT")
             offs.append(None)
-            continue
-        if L is not None and lp == L:
-            ev = ev_at.get((cid, L))
+        elif L is None or lp >= L:
+            ev = ev_at.get((cid, lp))
             flag = latest_flag.get(cid, "")
             if ev in ("NEW", "ADDED", "RETURNED"):
                 st = ev
@@ -427,13 +436,13 @@ def finalize(db):
             statuses.append(st)
             offs.append(0)
         else:
-            n = len([x for x in sub_weeks.get(sub, []) if x > lp])
-            statuses.append("DROPPED - likely sold out" if n == 1 else "SOLD OUT")
+            n = len([x for x in cov if x > lp])
+            statuses.append("DROPPED - likely sold out" if n == 1 and ev_at.get((cid, L)) == "DROPPED"
+                            else "SOLD OUT")
             offs.append(n)
     comm["status"], comm["first_week"], comm["last_reported"], comm["weeks_off_report"] = \
         statuses, firsts, lasts, offs
     db["communities"] = comm.reindex(columns=COMM_COLS)
-
 
 # --------------------------------------------------------------------------- legacy
 LEGACY_GROUP_MARKET = {

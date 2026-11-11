@@ -84,7 +84,7 @@ tab_imp, tab_db, tab_legacy = st.tabs(["Import PDF", "Database", "One-time legac
 # ----------------------------------------------------------------- import tab
 with tab_imp:
     st.subheader("2. Upload this week's Ryness Report PDF")
-    pdfs = st.file_uploader("Ryness Report PDF(s) - several weeks can be loaded at once",
+    pdfs = st.file_uploader("Ryness Report PDF(s) - any week, newer or older; several can be loaded at once",
                             type=["pdf"], accept_multiple_files=True)
     parsed = []
     for f in pdfs or []:
@@ -104,6 +104,10 @@ with tab_imp:
             st.markdown(f"#### {name} &mdash; week ending **{res.week_ending:%A, %B %d, %Y}**")
             if res.week_ending in pdf_weeks:
                 st.warning("This week is already in the database. Importing again replaces it.")
+            elif pdf_weeks and res.week_ending < pdf_weeks[-1]:
+                st.info(f"Older than the latest week in the database ({pdf_weeks[-1]:%m/%d/%Y}) - it will be "
+                        "backfilled into its place in the timeline. Current community names, units and "
+                        "statuses still come from the newest report.")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Communities", len(df))
             c2.metric("Gross sales", int(df.gross_sales.sum()))
